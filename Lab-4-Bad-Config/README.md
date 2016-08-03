@@ -2,6 +2,10 @@
 
 M.Chambers 2016
 
+Please understand that I do not support this code, and neither does anyone else. Sorry.
+
+You should never install anything in an AWS account that is not supported (i.e. written and support by you, verified and supported by you, or under a 3rd party support arrangement).  To verify a 'thing' you could absolutely install it in an isolated test environment, but even then under a watchful eye, especially if the 'thing' is going to incur costs.
+
 ## aCloud.Guru
 
 This file was created for the purposes of the Event Based Security course from aCloud.Guru
@@ -15,13 +19,13 @@ We evaluate SECURITY GROUPS, but report back on INSTANCES.
 
 If the INSTANCE changes, we evaluate is based on its security groups.
 
-But if a SECURITY GROUP changes we need to make sure that a compliant 
-evaluation of the security group does not incorrectly evaluate an otherwise 
-in-compliant instance.  Therefore, when one security group changes we need 
+But if a SECURITY GROUP changes we need to make sure that a compliant
+evaluation of the security group does not incorrectly evaluate an otherwise
+in-compliant instance.  Therefore, when one security group changes we need
 to evaluate ALL the security groups for ALL the related instances.
 
-Therefore we need to trigger this rule for EITHER security group changes OR instance changes 
-(e.g. if the instance adds or removes security groups we need to evaluate based on instance, 
+Therefore we need to trigger this rule for EITHER security group changes OR instance changes
+(e.g. if the instance adds or removes security groups we need to evaluate based on instance,
 if a security group changes rules we need to be triggered by the change in security group.)
 
 ## How to setup:
