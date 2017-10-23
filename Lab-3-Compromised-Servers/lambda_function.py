@@ -1,3 +1,13 @@
+#! /usr/bin/python
+"""Lambda for Shutting down compromised servers.
+
+AWS Lambda function is to support event-driven security based on evaluating.
+the VPC Flow Logs to see if any EC2 instances have been compromised.  In the
+event of a compromise will send a SNS notification to shutdown the EC2 instance
+that will be set to start a fresh instance.
+
+"""
+
 import json
 import gzip
 import base64
@@ -5,196 +15,232 @@ from StringIO import StringIO
 import sets
 import urllib2
 import boto3
+import logging
 from netaddr import IPNetwork, IPAddress
 
-#
-# User variables:
-#
+# User variables
 dryrun = False
 allowAWS = True
-exceptions = [ 
-	{"cidr": "0.0.0.0/0", "port": "123"}   
+exceptions = [
+    {"cidr": "0.0.0.0/0", "port": "123"}
 ]
 snsArn = "arn:aws:sns:us-east-1:012345678901:instanceKiller"
-#
+
 # Built in variables
-#
 aws_data_source_url = 'https://ip-ranges.amazonaws.com/ip-ranges.json'
 aws_service = "AMAZON"
 aws_ports = ["80", "443"]
 
-def getInstanceForEniId(eniId):
-	ec2 = boto3.resource('ec2')
-	try:
-		network_interface = ec2.NetworkInterface(eniId)
-		return network_interface.attachment['InstanceId']
-	except:
-		return False
+# Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+def getInstanceIdByInterfaceId(eniId):
+    """Return the ec2 instances given the interface id.
+
+    Return the ec2 instance given the interfaceß id, if instance id does not
+    exist, then return false for unknown interface.
+
+    """
+    ec2 = boto3.resource('ec2')
+    instance = False
+    try:
+        network_interface = ec2.NetworkInterface(eniId)
+        instance = network_interface.attachment['InstanceId']
+    except(ex):
+        logger.info("Interface: {} is unknown".format(eniId))
+    return instance
+
 
 def parseEvent(event):
-	# get CloudWatch logs
-	data = str(event['awslogs']['data'])
-	# decode and uncompress CloudWatch logs
-	logs = gzip.GzipFile(fileobj=StringIO(data.decode('base64', 'strict'))).read()
-	# convert the log data from JSON into a dictionary
-	return json.loads(logs)
+    """Return parsed events from cloudwatch."""
+    # get CloudWatch logs
+    data = str(event['awslogs']['data'])
+    # decode and uncompress CloudWatch logs
+    logs = gzip.GzipFile(fileobj=StringIO(
+            data.decode('base64', 'strict'))).read()
+    # convert the log data from JSON into a dictionary
+    return json.loads(logs)
 
-def checkForException( dstaddr, dstport ):
-	for exception in exceptions:
-		if  (( IPAddress(dstaddr) in IPNetwork(exception['cidr']) )
-			and
-			( dstport == exception['port'] )):
-			print("LOG: Allowed within exception cidr {} and port {}".format( exception['cidr'], exception['port']))
-			return True
-	return False
+
+def isIpException(dstaddr, dstport):
+    """Return boolean if IP Address is in the exceptions list."""
+    for exception in exceptions:
+        if ((IPAddress(dstaddr) in IPNetwork(exception['cidr'])) and
+                (dstport == exception['port'])):
+            msg = "Allowed within exception cidr {} and port{}".format(
+                    exception['cidr'], exceptoin['port'])
+            logging.info(msg)
+            return True
+    return False
+
 
 def addAWSExceptions():
-	
-	print("LOG: Adding AWS endpoints to exceptions list.")
-	
-	data = urllib2.urlopen(aws_data_source_url)
-	ipRanges = json.load(data)
+    """Add AWS Managed Service IP Addresses to exceptions."""
+    logger.info("Adding AWS endpoints to exceptions list.")
 
-	for range in ipRanges['prefixes']:
-		if range['service'] == aws_service:
-			for port in aws_ports:
-				part = {}
-				part['cidr'] = range['ip_prefix']
-				part['port'] = port
-				exceptions.append(part)
+    # Gets and parses AWS IP Addresses into JSON object.
+    data = urllib2.urlopen(aws_data_source_url)
+    ipRanges = json.load(data)
 
-def killInstance( instanceId ):
+    # Loops through all IP Addresses and creates a hash and adds to exceptions.
+    for range in ipRanges['prefixes']:
+        if range['service'] == aws_service:
+            for port in aws_ports:
+                part = {}
+                part['cidr'] = range['ip_prefix']
+                part['port'] = port
+                exceptions.append(part)
 
-	print("LOG: Killing instance {}".format( instanceId ))
-	
-	try:
-		ec2 = boto3.resource('ec2')
-		instance = ec2.Instance(instanceId)
-	except:
-		print("ERROR: Unable to find instance to kill. {}".format(instanceId))
-		return False
 
-	#Stop instance
-	print("LOG: Sending stop message to instance. {}".format(instanceId))
-	try:
-		response = instance.stop(
-			DryRun=dryrun,
-			Force=True
-		)
-	except:
-		print("ERROR: Unable to stop instance. {}".format(instanceId))
-		return False
+def getInstanceById(instanceId):
+    """Return ec2 instance by instance id."""
+    try:
+        ec2 = boto3.resource('ec2')
+        instance = ec2.Instance(instanceId)
+    except(ex):
+        raise Exception("Unable to find instance. {}".format(instanceId))
 
-	#Snapshot volumes
-	volume_iterator = instance.volumes.all()
-	for volume in volume_iterator:
-		snapshot = snapShotInstance( volume.id, instanceId )
-		if snapshot:
-			print("LOG: Snapshot for instance {} volume {} snapshot {}".format( instanceId, volume.id, snapshot ))
-		else:
-			print("WARNING: Unable to snapshot for instance {} volume {}".format( instanceId, volume.id ))
 
-	#Terminate instance
-	print("LOG: Sending terminate message to instance. {}".format(instanceId))
-	try:
-		response = instance.terminate(
-			DryRun=dryrun
-		)
-	except:
-		print("ERROR: Unable to terminate instance to kill. {}".format(instanceId))
-		return False
-		
-	sendNotification( instanceId, snapshot )
+def stopInstance(instance):
+    """Stop ec2 instance given the ec2 object."""
+    logging.info("Sending stop message to instance. {}".format(instanceId))
+    try:
+        response = instance.stop(
+            DryRun=dryrun,
+            Force=True
+        )
+    except(ex):
+        raise Exception("Unable to stop instance. {}".format(instanceId))
 
-def snapShotInstance( volumeId, instanceId ):
 
-	try:
-		ec2 = boto3.resource('ec2')
-		volume = ec2.Volume(volumeId)
-	except:
-		print("ERROR: Unable to find volume {} to snapshot".format(volumeId))
-		return False
-	
-	snapshot = volume.create_snapshot(
-		DryRun=dryrun,
-		Description="Snapshot for instance {} made by the instanceKiller.".format(instanceId)
-	)
+def snapshotVolumeById(volumeId, instanceId):
+    """Create a snapshot of a volume by volume id."""
+    try:
+        ec2 = boto3.resource('ec2')
+        volume = ec2.Volume(volumeId)
+    except(ex):
+        Exception("Unable to find volume {} to snapshot".format(volumeId))
 
-	return snapshot.id
-	
+    desc = "Snapshot for instance {} made by the instanceKiller."
+    snapshot = volume.create_snapshot(
+        DryRun=dryrun,
+        Description=desc.format(instanceId)
+    )
 
-def sendNotification( instanceId, snapshotId ):
-	
-	client = boto3.client('sns')
-	
-	try:
-		response = client.publish(
-			TopicArn=snsArn,
-			Message="Instance {} has been terminated.  Snapshot {} created.".format( instanceId, snapshotId  ),
-			Subject='InstanceKiller has terminated an instance'
-		)
-		print("LOG: SNS Notification sent.")
-	except:
-		print("ERROR: Unable to send SNS notification.")	
-	
+    return snapshot.id
+
+
+def snapshotInstance(instance):
+    """Create a snapshot of every volume inside an instance."""
+    volume_iterator = instance.volumes.all()
+    for volume in volume_iterator:
+        try:
+            snapshot = snapshotVolumeById(volume.id, instanceId)
+            logging.info("Snapshot for instance {} volume {} snapshot {}"
+                         .format(instanceId, volume.id, snapshot))
+        except(ex):
+            logging.warning(ex.msg)
+
+
+def killInstance(instanceId):
+    logging.info("Killing instance".format(instanceId))
+    instance = getInstanceById(instanceId)
+    stopInstance(instance)
+    snapshotInstance(instance)
+    logging.info(Sending terminate message to instance. {}".format(instanceId))
+    try:
+        response = instance.terminate(DryRun=dryrun)
+    except(ex):
+        raise Exception("Unable to terminate instance to kill. {}"
+                        .format(instanceId))
+
+    sendNotification(instanceId, snapshot)
+
+
+def sendNotification(instanceId, snapshotId):
+    """Send a notification that an instance has been terminated."""
+    client = boto3.client('sns')
+    msg = "Instance {} has been terminated.  Snapshot {} created."
+    try:
+        response = client.publish(
+            TopicArn=snsArn,
+            Message=msg.format(instanceId, snapshotId)
+            Subject='InstanceKiller has terminated an instance'
+        )
+        logging.info("SNS Notification sent.")
+    except(ex):
+        logging.error("Unable to send SNS notification.")
+
 
 def lambda_handler(event, context):
+    """Main entrypoint for lambda function.
 
-	# Print out the event, helps with debugging
-	print(event)
+    Loops through VPC Flow Log event, parses and validates if the server has
+    been compromised.
 
-	events = parseEvent(event)
-	#print(events)
+    """
 
-	if allowAWS:
-		addAWSExceptions()
+    # Print out the event, helps with debugging
+    print(event)
 
-	#print(exceptions)
+    events = parseEvent(event)
 
-	killList = set()
-	unknownInterfaces = []
+    if allowAWS:
+        addAWSExceptions()
 
-	for record in events['logEvents']:
-	
-		try:
-			extractedFields = record['extractedFields']
-		except:
-			raise Exception("ERROR: Could not find 'extractedFields' is the CloudWatch feed set correctly?")
-			return False
-		
-		instanceId = getInstanceForEniId(extractedFields['interface_id'])
-		
-		if instanceId:
-		
-			print("LOG: Instance:{}\t Interface:{}\t SrcAddr:{}\t DstAddr:{}\t DstPort:{}\t".format( 
-				instanceId,
-				extractedFields['interface_id'],
-				extractedFields['srcaddr'],
-				extractedFields['dstaddr'],
-				extractedFields['dstport']
-			))
-			
-			if checkForException( extractedFields['dstaddr'], extractedFields['dstport'] ):
-				print("LOG: OK")
-				True
-			else:
-				print("LOG: ALERT!! Disallowed traffic {}:{} by instance {}".format( extractedFields['dstaddr'], extractedFields['dstport'],  instanceId ))
-				killList.add(instanceId)
-				
-		else:
-			unknownInterfaces.append(extractedFields['interface_id'])
+    killList = set()
+    unknownInterfaces = []
 
-	print("LOG: There are {} instances on the kill list!".format( len(killList) ))
-	
-	if len(unknownInterfaces):
-		print("LOG: Found {} interfaces not attached to instances (probably an ELB).".format( len(unknownInterfaces) ))
-		print("LOG: Interfaces without instances:{}".format(unknownInterfaces))
-	
-	killed = 0
-	
-	for instanceId in killList:
-		if killInstance( instanceId ):
-			killed = killed + 1
+    for record in events['logEvents']:
 
-	return ("Killed {} instances.".format( killed ))
-	
+        try:
+            extractedFields = record['extractedFields']
+        except(ex):
+            raise Exception("Could not find 'extractedFields' is the " +
+                            "CloudWatch feed set correctly?")
+
+        instanceId = getInstanceIdByInterfaceId(
+            extractedFields['interface_id'])
+
+        if instanceId:
+            instaneInfo = "Instance:{}\t Interface:{}\t SrcAddr:{}\t " +
+            "DstAddr:{}\t DstPort:{}\t"
+            logging.info(instanceInfo.format(
+                    instanceId,
+                    extractedFields['interface_id'],
+                    extractedFields['srcaddr'],
+                    extractedFields['dstaddr'],
+                    extractedFields['dstport']
+            ))
+
+            if isIpException(extractedFields['dstaddr'],
+                             extractedFields['dstport']):
+                logging.info("OK")
+            else:
+                logging.info("ALERT!! Disallowed traffic {}", instanceInfo)
+                killList.add(instanceId)
+
+        else:
+            unknownInterfaces.append(extractedFields['interface_id'])
+
+    logging.info("There are {} instances on the kill list!".format(
+            len(killlist)))
+
+    if len(unknownInterfaces):
+        logging.info("Found {} interfaces not attached to instances "
+                     + "(probably an ELB).".format(len(unknownInterfaces)))
+        logging.info("Interfaces without instances:{}".format(
+                unknownInterfaces))
+
+    killed = 0
+
+    for instanceId in killList:
+        try:
+            killInstance(instanceId)
+            killed += 1
+        except(ex):
+            logging.error(ex.msg)
+
+    return ("Killed {} instances.".format(killed))
