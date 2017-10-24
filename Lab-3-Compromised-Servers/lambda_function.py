@@ -8,170 +8,19 @@ that will be set to start a fresh instance.
 
 """
 
-import json
-import gzip
-import base64
-from StringIO import StringIO
-import sets
-import urllib2
-import boto3
+import os
+import yaml
 import logging
-from netaddr import IPNetwork, IPAddress
+from vpc.event import VpcEvent, VpcEventUtility
+from vpc.networkmgmt import NetworkAddress, NetworkMgmt, NetworkMgmtUtility
 
 # User variables
-dryrun = False
-allowAWS = True
-exceptions = [
-    {"cidr": "0.0.0.0/0", "port": "123"}
-]
-snsArn = "arn:aws:sns:us-east-1:012345678901:instanceKiller"
-
-# Built in variables
+network_exceptions = [NetworkAddress("0.0.0.0/0", "123")]
 aws_data_source_url = 'https://ip-ranges.amazonaws.com/ip-ranges.json'
 aws_service = "AMAZON"
 aws_ports = ["80", "443"]
-
-# Logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-
-def getInstanceIdByInterfaceId(eniId):
-    """Return the ec2 instances given the interface id.
-
-    Return the ec2 instance given the interfaceß id, if instance id does not
-    exist, then return false for unknown interface.
-
-    """
-    ec2 = boto3.resource('ec2')
-    instance = False
-    try:
-        network_interface = ec2.NetworkInterface(eniId)
-        instance = network_interface.attachment['InstanceId']
-    except(ex):
-        logger.info("Interface: {} is unknown".format(eniId))
-    return instance
-
-
-def parseEvent(event):
-    """Return parsed events from cloudwatch."""
-    # get CloudWatch logs
-    data = str(event['awslogs']['data'])
-    # decode and uncompress CloudWatch logs
-    logs = gzip.GzipFile(fileobj=StringIO(
-            data.decode('base64', 'strict'))).read()
-    # convert the log data from JSON into a dictionary
-    return json.loads(logs)
-
-
-def isIpException(dstaddr, dstport):
-    """Return boolean if IP Address is in the exceptions list."""
-    for exception in exceptions:
-        if ((IPAddress(dstaddr) in IPNetwork(exception['cidr'])) and
-                (dstport == exception['port'])):
-            msg = "Allowed within exception cidr {} and port{}".format(
-                    exception['cidr'], exceptoin['port'])
-            logging.info(msg)
-            return True
-    return False
-
-
-def addAWSExceptions():
-    """Add AWS Managed Service IP Addresses to exceptions."""
-    logger.info("Adding AWS endpoints to exceptions list.")
-
-    # Gets and parses AWS IP Addresses into JSON object.
-    data = urllib2.urlopen(aws_data_source_url)
-    ipRanges = json.load(data)
-
-    # Loops through all IP Addresses and creates a hash and adds to exceptions.
-    for range in ipRanges['prefixes']:
-        if range['service'] == aws_service:
-            for port in aws_ports:
-                part = {}
-                part['cidr'] = range['ip_prefix']
-                part['port'] = port
-                exceptions.append(part)
-
-
-def getInstanceById(instanceId):
-    """Return ec2 instance by instance id."""
-    try:
-        ec2 = boto3.resource('ec2')
-        instance = ec2.Instance(instanceId)
-    except(ex):
-        raise Exception("Unable to find instance. {}".format(instanceId))
-
-
-def stopInstance(instance):
-    """Stop ec2 instance given the ec2 object."""
-    logging.info("Sending stop message to instance. {}".format(instanceId))
-    try:
-        response = instance.stop(
-            DryRun=dryrun,
-            Force=True
-        )
-    except(ex):
-        raise Exception("Unable to stop instance. {}".format(instanceId))
-
-
-def snapshotVolumeById(volumeId, instanceId):
-    """Create a snapshot of a volume by volume id."""
-    try:
-        ec2 = boto3.resource('ec2')
-        volume = ec2.Volume(volumeId)
-    except(ex):
-        Exception("Unable to find volume {} to snapshot".format(volumeId))
-
-    desc = "Snapshot for instance {} made by the instanceKiller."
-    snapshot = volume.create_snapshot(
-        DryRun=dryrun,
-        Description=desc.format(instanceId)
-    )
-
-    return snapshot.id
-
-
-def snapshotInstance(instance):
-    """Create a snapshot of every volume inside an instance."""
-    volume_iterator = instance.volumes.all()
-    for volume in volume_iterator:
-        try:
-            snapshot = snapshotVolumeById(volume.id, instanceId)
-            logging.info("Snapshot for instance {} volume {} snapshot {}"
-                         .format(instanceId, volume.id, snapshot))
-        except(ex):
-            logging.warning(ex.msg)
-
-
-def killInstance(instanceId):
-    logging.info("Killing instance".format(instanceId))
-    instance = getInstanceById(instanceId)
-    stopInstance(instance)
-    snapshotInstance(instance)
-    logging.info(Sending terminate message to instance. {}".format(instanceId))
-    try:
-        response = instance.terminate(DryRun=dryrun)
-    except(ex):
-        raise Exception("Unable to terminate instance to kill. {}"
-                        .format(instanceId))
-
-    sendNotification(instanceId, snapshot)
-
-
-def sendNotification(instanceId, snapshotId):
-    """Send a notification that an instance has been terminated."""
-    client = boto3.client('sns')
-    msg = "Instance {} has been terminated.  Snapshot {} created."
-    try:
-        response = client.publish(
-            TopicArn=snsArn,
-            Message=msg.format(instanceId, snapshotId)
-            Subject='InstanceKiller has terminated an instance'
-        )
-        logging.info("SNS Notification sent.")
-    except(ex):
-        logging.error("Unable to send SNS notification.")
+dryrun = False
+allowAWS = True
 
 
 def lambda_handler(event, context):
@@ -182,65 +31,85 @@ def lambda_handler(event, context):
 
     """
 
-    # Print out the event, helps with debugging
-    print(event)
+    # Setup logging for the application based on the logging.yaml file.
+    setup_logging()
 
-    events = parseEvent(event)
-
+    # Build whitelist for network security
+    networkWhiteList = NetworkMgmt()
+    networkWhiteList.addExceptions(network_exceptions)
     if allowAWS:
-        addAWSExceptions()
+        networkWhiteList.addExceptions(
+                NetworkMgmtUtility.getAwsWhiteList(aws_data_source_url,
+                                                   aws_service, aws_ports))
 
-    killList = set()
-    unknownInterfaces = []
-
-    for record in events['logEvents']:
-
-        try:
-            extractedFields = record['extractedFields']
-        except(ex):
-            raise Exception("Could not find 'extractedFields' is the " +
-                            "CloudWatch feed set correctly?")
-
-        instanceId = getInstanceIdByInterfaceId(
-            extractedFields['interface_id'])
-
-        if instanceId:
-            instaneInfo = "Instance:{}\t Interface:{}\t SrcAddr:{}\t " +
-            "DstAddr:{}\t DstPort:{}\t"
-            logging.info(instanceInfo.format(
-                    instanceId,
-                    extractedFields['interface_id'],
-                    extractedFields['srcaddr'],
-                    extractedFields['dstaddr'],
-                    extractedFields['dstport']
-            ))
-
-            if isIpException(extractedFields['dstaddr'],
-                             extractedFields['dstport']):
-                logging.info("OK")
-            else:
-                logging.info("ALERT!! Disallowed traffic {}", instanceInfo)
-                killList.add(instanceId)
-
-        else:
-            unknownInterfaces.append(extractedFields['interface_id'])
-
+    # Filter events into kill and unknown lists.
+    records = sortLoggedEvents(event, networkWhiteList)
     logging.info("There are {} instances on the kill list!".format(
-            len(killlist)))
+            len(records['kill'])))
 
+    # Process unknown and kill events.
+    processUnknownInterfaces(records['unknown'])
+    killInstances(records['kill'])
+
+
+def setup_logging(default_path='logging.yaml', default_level=logging.INFO,
+                  env_key='LOG_CFG'):
+    """Setup logging configuration"""
+    path = default_path
+    value = os.getenv(env_key, None)
+    if value:
+        path = value
+    if os.path.exists(path):
+        with open(path, 'rt') as f:
+            config = yaml.safe_load(f.read())
+        logging.config.dictConfig(config)
+    else:
+        logging.basicConfig(level=default_level)
+
+
+def sortLoggedEvents(event, whitelist):
+    """Return a dictionary of events needing processed (kill & unknown)."""
+    records = {'kill' = [], 'unknown' = []}
+
+    for record in VpcEventUtility.parseEvent(event)['logEvents']:
+        # Parse record into VpcEvent object.
+        if 'extractedFields' not in record continue
+        vpcEvent = VpcEvent(record)
+
+        # Retrieve instance identifer from AWS
+        instanceId = VpcEventUtility.getInstanceIdByInterfaceId(interfaceId)
+        vpcEvent.setInstanceId(instanceId)
+
+        # Filter object based on unknown or kill
+        logging.info(vpcEvent.toString())
+        if vpcEvent.isUnknown:
+            # if no instance id
+            records['unknown'].append(vpcEvent)
+        else if not whitelist.contains(
+                    vpcEvent.getDestination()['addr'],
+                vpcEvent.getDestination()['port']):
+            # if not in the whitelist, put in kill list.
+            records['kill'].append(vpcEvent)
+    return records
+
+
+def processUnknownInterfaces(unknownInterfaces):
+    """Process unknown interfaces."""
     if len(unknownInterfaces):
         logging.info("Found {} interfaces not attached to instances "
                      + "(probably an ELB).".format(len(unknownInterfaces)))
         logging.info("Interfaces without instances:{}".format(
                 unknownInterfaces))
 
-    killed = 0
 
-    for instanceId in killList:
+def killInstances(killList):
+    """Kill instances that are compromised."""
+    killed = 0
+    for vpcEvent in killList:
         try:
-            killInstance(instanceId)
+            VpcEventUtility.killInstance(vpcEvent)
             killed += 1
         except(ex):
             logging.error(ex.msg)
 
-    return ("Killed {} instances.".format(killed))
+    logging.info("Killed {} instances.".format(killed))
